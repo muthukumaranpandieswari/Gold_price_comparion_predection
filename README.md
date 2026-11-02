@@ -2,14 +2,6 @@
 
 A small Python monitor that records MCX India and COMEX gold prices, compares each new sample with its recent history, and emails an alert when a market drops by the configured threshold. WhatsApp/Twilio notifications have been replaced with SMTP email.
 
-## What it does
-
-- Fetches prices from configurable market-data endpoints (or Yahoo Finance symbols).
-- Stores price samples in a local SQLite database.
-- Compares each new sample with the previous rolling average.
-- Sends an email when a price falls by at least `ALERT_PERCENT_DROP`.
-- Can run on a schedule using cron.
-
 ## Setup
 
 1. Install Python 3.10 or later and create an environment:
@@ -26,15 +18,23 @@ A small Python monitor that records MCX India and COMEX gold prices, compares ea
    cp .env.example .env
    ```
 
-   Edit `.env` and set `SMTP_HOST`, `SMTP_PORT`, `SMTP_USER`, `SMTP_PASSWORD`, `EMAIL_FROM`, and `EMAIL_TO`. Use an app password if your email provider requires one. Set `MCX_PRICE_API_URL` to a provider that returns the current MCX gold price, or set `MCX_SYMBOL` if using Yahoo Finance. COMEX defaults to the Yahoo Finance `GC=F` chart endpoint.
+   Edit `.env` and set `SMTP_HOST`, `SMTP_PORT`, `SMTP_USER`, `SMTP_PASSWORD`, and `EMAIL_FROM`. `EMAIL_TO` is set to `hapieeji@gmail.com` in the sample; change it if desired. Use an app password if your email provider requires one. Set `MCX_PRICE_API_URL` to a provider that returns the current MCX gold price, or set `MCX_SYMBOL` if using Yahoo Finance. COMEX defaults to the Yahoo Finance `GC=F` chart endpoint.
 
-3. Run a check:
+3. Verify SMTP by sending a test email to the configured `EMAIL_TO` address:
+
+   ```bash
+   python3 market_alert.py --test-email
+   ```
+
+   A successful run confirms that the SMTP server accepted the message; check the recipient's inbox and spam folder to confirm delivery. Do not share SMTP passwords in chat or commit them to the repository.
+
+4. Run a price check:
 
    ```bash
    python3 market_alert.py
    ```
 
-Email is sent only after enough price history exists to detect a drop. Before email settings are configured, alert details are printed to the terminal.
+Email alerts are sent only after enough price history exists to detect a drop. The `--test-email` option tests email delivery without fetching prices.
 
 ## Configuration
 
