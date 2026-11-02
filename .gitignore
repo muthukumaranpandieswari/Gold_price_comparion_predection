@@ -1,0 +1,99 @@
+# Gold Price Comparison Alert
+
+This repository contains a simple Python alert system that watches MCX India gold and COMEX US gold prices, compares their recent history, and sends a WhatsApp alert if either market drops sharply relative to its recent average.
+
+## What it does
+
+- Pulls prices from configurable public APIs or Yahoo Finance symbols.
+- Stores recent price samples in a local SQLite database.
+- Checks the latest value versus the rolling history.
+- Triggers when the drop is greater than or equal to the configured threshold.
+- Sends the alert over WhatsApp by using Twilio's WhatsApp API.
+- Runs automatically every 30 minutes through cron.
+
+## Files
+
+- `market_alert.py` — main app logic.
+- `.env.example` — sample config values.
+- `cronjob.txt` — cron entry for the 30-minute schedule.
+- `requirements.txt` — Python dependencies.
+
+## Setup
+
+1. Clone this repository and move into it.
+2. Create the Python environment:
+
+```bash
+python3 -m venv .venv
+source .venv/bin/activate
+pip install -r requirements.txt
+```
+
+3. Copy and complete the environment file:
+
+```bash
+cp .env.example .env
+```
+
+4. Fill in the values in `.env`:
+
+- `MCX_PRICE_API_URL` — endpoint that returns the latest MCX gold price.
+- `COMEX_PRICE_API_URL` — endpoint that returns the latest COMEX gold price.
+- `MCX_SYMBOL` and `COMEX_SYMBOL` — optional Yahoo Finance symbols for fallback if the API URL is not available.
+- `ALERT_PERCENT_DROP` — e.g. `5.0` for a 5% fall.
+- `TWILIO_ACCOUNT_SID`, `TWILIO_AUTH_TOKEN`, `WHATSAPP_FROM`, `WHATSAPP_TO` — Twilio credentials and destination WhatsApp number.
+
+Example config values:
+
+```env
+MCX_PRICE_API_URL="https://your-backend.example.com/api/mcx-gold/latest"
+COMEX_PRICE_API_URL="https://query1.finance.yahoo.com/v8/finance/chart/GC=F"
+ALERT_PERCENT_DROP=5.0
+HISTORY_WINDOW=12
+TWILIO_ACCOUNT_SID="AC..."
+TWILIO_AUTH_TOKEN="..."
+WHATSAPP_FROM="whatsapp:+14155238886"
+WHATSAPP_TO="whatsapp:+919876543210"
+```
+
+## Important notes
+
+- The script stores all measurements in `market_history.db`.
+- It calculates percentage change versus the recent rolling average.
+- If you do not configure Twilio credentials, the script prints the alert to the terminal instead of sending a message.
+- For MCX, some market sources do not have a public API. In that case, use your own backend or a paid data provider and set `MCX_PRICE_API_URL` accordingly.
+
+## Run manually
+
+```bash
+python3 market_alert.py
+```
+
+## Cron schedule
+
+To run every 30 minutes, install the cron entry:
+
+```bash
+crontab cronjob.txt
+```
+
+The default cron rule is:
+
+```cron
+*/30 * * * * /usr/bin/python3 /opt/gold_market_alert/market_alert.py >> /var/log/gold_market_alert.log 2>&1
+```
+
+Replace `/opt/gold_market_alert` with the path where this project is installed.
+
+## Alert example
+
+A typical WhatsApp message looks like this:
+
+```text
+Gold alert: MCX vs COMEX sharp drop detected. MCX=₹72,432.00, COMEX=$2,332.50, MCX change=-6.30%, COMEX change=-4.80%. Threshold=5.00% over last 12 samples.
+```
+
+## Recommended next step
+
+For production use, replace the demo API URLs with your real MCX and COMEX data source and add your actual WhatsApp destination number.
+

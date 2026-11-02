@@ -1,0 +1,249 @@
+#!/usr/bin/env python3
+import json
+import os
+import sqlite3
+import sys
+from datetime import datetime
+from pathlib import Path
+from typing import Any, Dict, List, Optional
+
+import requests
+from dotenv import load_dotenv
+from twilio.rest import Client
+
+
+ROOT = Path(__file__).resolve().parent
+load_dotenv(ROOT / ".env")
+
+
+DB_PATH = os.getenv("DB_PATH", str(ROOT / "market_history.db"))
+ALERT_PERCENT_DROP = float(os.getenv("ALERT_PERCENT_DROP", "5.0"))
+HISTORY_WINDOW = int(os.getenv("HISTORY_WINDOW", "12"))
+TIMEZONE = os.getenv("TIMEZONE", "Asia/Kolkata")
+
+MCX_PRICE_API_URL = os.getenv("MCX_PRICE_API_URL", "").strip()
+COMEX_PRICE_API_URL = os.getenv("COMEX_PRICE_API_URL", "").strip()
+MCX_SYMBOL = os.getenv("MCX_SYMBOL", "").strip()
+COMEX_SYMBOL = os.getenv("COMEX_SYMBOL", "GC=F").strip()
+
+TWILIO_ACCOUNT_SID = os.getenv("TWILIO_ACCOUNT_SID", "").strip()
+TWILIO_AUTH_TOKEN = os.getenv("TWILIO_AUTH_TOKEN", "").strip()
+WHATSAPP_FROM = os.getenv("WHATSAPP_FROM", "").strip()
+WHATSAPP_TO = os.getenv("WHATSAPP_TO", "").strip()
+
+
+def init_db() -> None:
+    conn = sqlite3.connect(DB_PATH)
+    try:
+        conn.execute(
+            """
+            CREATE TABLE IF NOT EXISTS price_history (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                symbol TEXT NOT NULL,
+                price REAL NOT NULL,
+                captured_at TEXT NOT NULL
+            )
+            """
+        )
+        conn.commit()
+    finally:
+        conn.close()
+
+
+def get_connection() -> sqlite3.Connection:
+    conn = sqlite3.connect(DB_PATH)
+    conn.row_factory = sqlite3.Row
+    return conn
+
+
+def timestamp_now() -> str:
+    return datetime.utcnow().strftime("%Y-%m-%dT%H:%M:%SZ")
+
+
+def parse_numeric_value(payload: Any) -> float:
+    if isinstance(payload, (int, float)):
+        return float(payload)
+    if isinstance(payload, str):
+        return float(payload.strip())
+    raise ValueError(f"Unsupported numeric payload: {payload!r}")
+
+
+def extract_value_from_json(data: Any, candidate_keys: List[str]) -> float:
+    if isinstance(data, dict):
+        for key in candidate_keys:
+            if key in data:
+                return parse_numeric_value(data[key])
+        for nested_value in data.values():
+            try:
+                return extract_value_from_json(nested_value, candidate_keys)
+            except ValueError:
+                pass
+    if isinstance(data, list):
+        for item in data:
+            try:
+                return extract_value_from_json(item, candidate_keys)
+            except ValueError:
+                pass
+    raise ValueError(f"Could not locate any of {candidate_keys} in payload: {data!r}")
+
+
+def fetch_price_from_url(url: str) -> float:
+    response = requests.get(url, timeout=25)
+    response.raise_for_status()
+    payload = response.json()
+
+    # Common JSON structures used by public data APIs.
+    for keys in (
+        ["price", "lastPrice", "last", "value", "close", "currentPrice"],
+        ["priceData", "data", "result", "marketPrice"],
+    ):
+        try:
+            return extract_value_from_json(payload, keys)
+        except ValueError:
+            continue
+
+    # Some endpoints return a nested structure like { chart: { result: [{ meta: { regularMarketPrice: 123 } }] } }
+    if isinstance(payload, dict):
+        for key, value in payload.items():
+            if isinstance(value, dict):
+                try:
+                    return extract_value_from_json(value, ["regularMarketPrice", "lastPrice", "price"]) 
+                except ValueError:
+                    pass
+
+    raise ValueError(f"Unexpected payload structure from {url}: {payload!r}")
+
+
+def fetch_comex_price() -> float:
+    if COMEX_PRICE_API_URL:
+        try:
+            return fetch_price_from_url(COMEX_PRICE_API_URL)
+        except Exception as exc:
+            print(f"COMEX URL fetch failed: {exc}", file=sys.stderr)
+    try:
+        import yfinance as yf
+
+        if not COMEX_SYMBOL:
+            raise RuntimeError("COMEX_SYMBOL is empty and no COMEX_PRICE_API_URL was provided.")
+        data = yf.Ticker(COMEX_SYMBOL).history(period="1d", interval="1m")
+        if data.empty:
+            raise RuntimeError(f"No COMEX price data found for symbol {COMEX_SYMBOL}")
+        return float(data["Close"].iloc[-1])
+    except Exception as exc:
+        raise RuntimeError(f"Unable to fetch COMEX price: {exc}") from exc
+
+
+def fetch_mcx_price() -> float:
+    if MCX_PRICE_API_URL:
+        try:
+            return fetch_price_from_url(MCX_PRICE_API_URL)
+        except Exception as exc:
+            print(f"MCX URL fetch failed: {exc}", file=sys.stderr)
+    try:
+        import yfinance as yf
+
+        if not MCX_SYMBOL:
+            raise RuntimeError("MCX_SYMBOL is empty and no MCX_PRICE_API_URL was provided.")
+        data = yf.Ticker(MCX_SYMBOL).history(period="1d", interval="1m")
+        if data.empty:
+            raise RuntimeError(f"No MCX price data found for symbol {MCX_SYMBOL}")
+        return float(data["Close"].iloc[-1])
+    except Exception as exc:
+        raise RuntimeError(f"Unable to fetch MCX price: {exc}") from exc
+
+
+def store_price(symbol: str, price: float) -> None:
+    conn = get_connection()
+    try:
+        conn.execute(
+            "INSERT INTO price_history (symbol, price, captured_at) VALUES (?, ?, ?)",
+            (symbol, price, timestamp_now()),
+        )
+        conn.commit()
+    finally:
+        conn.close()
+
+
+def recent_prices(symbol: str, limit: int) -> List[float]:
+    conn = get_connection()
+    try:
+        rows = conn.execute(
+            "SELECT price FROM price_history WHERE symbol = ? ORDER BY id DESC LIMIT ?",
+            (symbol, limit),
+        ).fetchall()
+    finally:
+        conn.close()
+    return [float(row["price"]) for row in rows][::-1]
+
+
+def percent_change(current: float, baseline: float) -> float:
+    if baseline == 0:
+        return 0.0
+    return ((current - baseline) / baseline) * 100.0
+
+
+def should_alert_for_symbol(symbol: str, current_price: float, threshold: float) -> bool:
+    history = recent_prices(symbol, HISTORY_WINDOW)
+    if len(history) < 2:
+        return False
+    avg_history = sum(history) / len(history)
+    delta_pct = percent_change(current_price, avg_history)
+    print(f"{symbol}: current={current_price:.2f}, avg_history={avg_history:.2f}, delta_pct={delta_pct:.2f}%")
+    return delta_pct <= -abs(threshold)
+
+
+def send_whatsapp_alert(message: str) -> None:
+    if not TWILIO_ACCOUNT_SID or not TWILIO_AUTH_TOKEN or not WHATSAPP_FROM or not WHATSAPP_TO:
+        print("Twilio WhatsApp not configured. Alert message would be:")
+        print(message)
+        return
+
+    client = Client(TWILIO_ACCOUNT_SID, TWILIO_AUTH_TOKEN)
+    client.messages.create(
+        from_=WHATSAPP_FROM,
+        to=WHATSAPP_TO,
+        body=message,
+    )
+    print("WhatsApp alert sent successfully.")
+
+
+def build_alert_text(mcx_price: float, comex_price: float) -> str:
+    mcx_delta = percent_change(mcx_price, (sum(recent_prices("MCX", HISTORY_WINDOW)) / max(len(recent_prices("MCX", HISTORY_WINDOW)), 1))) if recent_prices("MCX", HISTORY_WINDOW) else 0.0
+    comex_delta = percent_change(comex_price, (sum(recent_prices("COMEX", HISTORY_WINDOW)) / max(len(recent_prices("COMEX", HISTORY_WINDOW)), 1))) if recent_prices("COMEX", HISTORY_WINDOW) else 0.0
+    return (
+        "Gold alert: MCX vs COMEX sharp drop detected. "
+        f"MCX=₹{mcx_price:,.2f}, COMEX=${comex_price:,.2f}, "
+        f"MCX change={mcx_delta:.2f}%, COMEX change={comex_delta:.2f}%. "
+        f"Threshold={ALERT_PERCENT_DROP:.2f}% over last {HISTORY_WINDOW} samples."
+    )
+
+
+def main() -> int:
+    init_db()
+
+    try:
+        mcx_price = fetch_mcx_price()
+        comex_price = fetch_comex_price()
+    except Exception as exc:
+        print(f"Could not fetch prices: {exc}", file=sys.stderr)
+        return 1
+
+    store_price("MCX", mcx_price)
+    store_price("COMEX", comex_price)
+
+    mcx_alert = should_alert_for_symbol("MCX", mcx_price, ALERT_PERCENT_DROP)
+    comex_alert = should_alert_for_symbol("COMEX", comex_price, ALERT_PERCENT_DROP)
+
+    if mcx_alert or comex_alert:
+        message = build_alert_text(mcx_price, comex_price)
+        print(message)
+        send_whatsapp_alert(message)
+        return 0
+
+    print(f"No alert. MCX {mcx_price}, COMEX {comex_price} within threshold.")
+    return 0
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())
+
